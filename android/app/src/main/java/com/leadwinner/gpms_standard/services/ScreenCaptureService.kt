@@ -1,5 +1,7 @@
 package com.leadwinner.gpms_standard.services
 
+import android.app.Activity
+import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -10,7 +12,6 @@ import android.graphics.Bitmap
 import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
-import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
@@ -18,171 +19,246 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import android.os.PowerManager
 import android.util.DisplayMetrics
 import android.util.Log
 import android.view.WindowManager
 import androidx.core.app.NotificationCompat
-import com.leadwinner.gpms_standard.MainActivity  // FIX 1: was "ccom."
-import com.leadwinner.gpms_standard.R
-import kotlinx.coroutines.*
-import org.json.JSONObject
+import com.leadwinner.gpms_standard.modules.MirrorModule
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenCaptureService : Service() {
 
-    // FIX 5: Only ONE companion object — pendingEvents merged in here
     companion object {
-        const val TAG = "ScreenCaptureService"
-        const val ACTION_START = "ACTION_START_CAPTURE"
-        const val ACTION_STOP = "ACTION_STOP_CAPTURE"
-        const val EXTRA_RESULT_CODE = "RESULT_CODE"
-        const val EXTRA_RESULT_DATA = "RESULT_DATA"
-        const val EXTRA_SHARE_CODE = "SHARE_CODE"
-        const val EXTRA_PORT = "PORT"
-        const val NOTIFICATION_CHANNEL_ID = "medimirror_capture"
-        const val NOTIFICATION_ID = 1001
-        const val TARGET_FPS = 15
-        const val JPEG_QUALITY = 55
+        private const val TAG          = "ScreenCaptureService"
+        const val ACTION_START         = "START_CAPTURE"
+        const val ACTION_STOP          = "STOP_CAPTURE"
+        const val EXTRA_SHARE_CODE     = "EXTRA_SHARE_CODE"
+        const val EXTRA_PORT           = "EXTRA_PORT"
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID   = "screen_capture_channel"
+        private const val CHANNEL_NAME = "Screen Capture Service"
 
-        // Moved here from the duplicate companion object that caused the conflict
-        val pendingEvents = ArrayDeque<Pair<String, String>>()
+        // ── FIX for MirrorModule errors #1 & #2 ──────────────────────────
+        // MirrorModule calls ScreenCaptureService.isRunning() and
+        // ScreenCaptureService.pendingEvents — both must live here as
+        // companion object members so they are reachable as static-style calls.
 
-        @Volatile
-        var instance: ScreenCaptureService? = null
+        /** True while the foreground capture service is active. */
+        private val _isRunning = AtomicBoolean(false)
+        fun isRunning(): Boolean = _isRunning.get()
 
-        fun isRunning() = instance != null
+        /** Thread-safe queue; MirrorModule polls this every 500 ms. */
+        val pendingEvents = CopyOnWriteArrayList<Pair<String, String>>()
     }
 
     private var mediaProjection: MediaProjection? = null
-    private var imageReader: ImageReader? = null
-    private var virtualDisplay: VirtualDisplay? = null
-    private var streamingServer: StreamingServer? = null
-    private var captureHandlerThread: HandlerThread? = null
-    private var captureHandler: Handler? = null
-    private var wakeLock: PowerManager.WakeLock? = null
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val isCapturing = AtomicBoolean(false)
-    private var lastFrameTime = 0L
-    private val frameIntervalMs = (1000L / TARGET_FPS)
+    private var virtualDisplay:  VirtualDisplay?  = null
+    private var imageReader:     ImageReader?      = null
+    private var streamingServer: StreamingServer?  = null
 
-    private var screenWidth = 0
+    private var screenWidth  = 0
     private var screenHeight = 0
-    private var screenDensity = 0
+    private var screenDpi    = 0
 
-    private val projectionCallback = object : MediaProjection.Callback() {
-        override fun onStop() {
-            Log.d(TAG, "MediaProjection stopped")
-            stopCapture()
-        }
-    }
+    private val isCapturing = AtomicBoolean(false)
+
+    private lateinit var captureThread:  HandlerThread
+    private lateinit var captureHandler: Handler
+
+    // ── Lifecycle ─────────────────────────────────────────────────────────
+
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
-        instance = this
-        createNotificationChannel()
-        acquireWakeLock()
+        captureThread  = HandlerThread("CaptureThread").also { it.start() }
+        captureHandler = Handler(captureThread.looper)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
+
             ACTION_START -> {
-                // ✅ MUST call startForeground() FIRST — Android 8+ kills the app
-                // if startForeground() isn't called within 5s of startForegroundService()
                 val shareCode = intent.getStringExtra(EXTRA_SHARE_CODE) ?: ""
-                val port = intent.getIntExtra(EXTRA_PORT, StreamingServer.DEFAULT_PORT)
-                startForegroundWithNotification(shareCode)  // ← moved UP before validation
+                val port      = intent.getIntExtra(EXTRA_PORT, StreamingServer.DEFAULT_PORT)
 
-                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, -1)
-                val resultData = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
-                } else {
-                    @Suppress("DEPRECATION")
-                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                startForegroundWithNotification(shareCode)
+
+                val resultCode: Int    = MirrorModule.pendingResultCode
+                val resultData: Intent? = MirrorModule.pendingResultData as? Intent
+
+                if (resultCode != Activity.RESULT_OK || resultData == null) {
+                    Log.e(TAG, "Invalid MediaProjection token — " +
+                            "resultCode=$resultCode data=$resultData")
+                    broadcastEventToRN("onCaptureError", "MediaProjection token missing")
+                    stopSelf()
+                    return START_NOT_STICKY
                 }
 
-                if (resultCode != -1 && resultData != null) {
-                    initScreenMetrics()
-                    startStreamingServer(port)
-                    startCapture(resultCode, resultData)
-                } else {
-                    Log.e(TAG, "Invalid MediaProjection data")
-                    stopSelf()  // safe now — startForeground() already called
-                }
+                initScreenMetrics()
+                startStreamingServer(port, shareCode)
+                startCapture(resultCode, resultData)
             }
-            ACTION_STOP -> {
-                stopCapture()
-                stopSelf()
-            }
+
+            ACTION_STOP -> stopCapture()
         }
-        return START_NOT_STICKY  // ← also changed from START_STICKY (see note below)
+        return START_NOT_STICKY
     }
+
+    override fun onDestroy() {
+        stopCapture()
+        captureThread.quitSafely()
+        super.onDestroy()
+    }
+
+    // ── Foreground notification ───────────────────────────────────────────
+
+    private fun startForegroundWithNotification(shareCode: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW
+            ).apply { description = "Screen mirroring is active" }
+            getSystemService(NotificationManager::class.java)
+                .createNotificationChannel(channel)
+        }
+
+        val stopIntent = PendingIntent.getService(
+            this, 0,
+            Intent(this, ScreenCaptureService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Screen Sharing Active")
+            .setContentText("Code: $shareCode  •  Tap to stop")
+            .setSmallIcon(android.R.drawable.ic_media_pause)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_delete, "Stop", stopIntent)
+            .build()
+
+        startForeground(NOTIFICATION_ID, notification)
+        _isRunning.set(true)   // mark running after startForeground succeeds
+    }
+
+    // ── Screen metrics ────────────────────────────────────────────────────
+
     private fun initScreenMetrics() {
-        val windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-        val metrics = DisplayMetrics()
+        val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val bounds = windowManager.currentWindowMetrics.bounds
-            screenWidth = bounds.width()
+            val bounds = wm.currentWindowMetrics.bounds
+            screenWidth  = bounds.width()
             screenHeight = bounds.height()
-            screenDensity = resources.displayMetrics.densityDpi
         } else {
             @Suppress("DEPRECATION")
-            windowManager.defaultDisplay.getRealMetrics(metrics)
-            screenWidth = metrics.widthPixels
-            screenHeight = metrics.heightPixels
-            screenDensity = metrics.densityDpi
+            val dm = DisplayMetrics().also { wm.defaultDisplay.getRealMetrics(it) }
+            screenWidth  = dm.widthPixels
+            screenHeight = dm.heightPixels
         }
-        Log.d(TAG, "Screen: ${screenWidth}x${screenHeight} @ ${screenDensity}dpi")
+        screenDpi = resources.displayMetrics.densityDpi
+        Log.d(TAG, "Screen: ${screenWidth}x${screenHeight} @ ${screenDpi}dpi")
     }
 
-    private fun startStreamingServer(port: Int) {
+    // ── Streaming server ──────────────────────────────────────────────────
+
+    private fun startStreamingServer(port: Int, shareCode: String) {
         streamingServer = StreamingServer(port).apply {
             setDeviceInfo(screenWidth, screenHeight, Build.MODEL)
-            onControlCommand = { json -> handleControlCommand(json) }
-            onClientConnected = { addr ->
-                Log.d(TAG, "Control device connected: $addr")
+
+            onControlCommand     = { json -> handleControlCommand(json) }
+
+            onClientConnected    = { addr ->
+                Log.d(TAG, "Viewer connected: $addr")
                 broadcastEventToRN("onClientConnected", addr)
             }
+
             onClientDisconnected = { addr ->
-                Log.d(TAG, "Control device disconnected: $addr")
+                Log.d(TAG, "Viewer disconnected: $addr")
                 broadcastEventToRN("onClientDisconnected", addr)
             }
-            onServerError = { ex ->
-                Log.e(TAG, "Server error", ex)
+
+            onClientAcknowledged = { addr ->
+                Log.d(TAG, "Viewer acknowledged (stream live): $addr")
+                broadcastEventToRN("onClientAcknowledged", addr)
             }
+
+            onServerError = { ex -> Log.e(TAG, "Server error: ${ex.message}", ex) }
+
             start()
         }
+        Log.d(TAG, "StreamingServer started — port=$port shareCode=$shareCode")
     }
 
-    private fun startCapture(resultCode: Int, data: Intent) {
-        val projectionManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-        mediaProjection = projectionManager.getMediaProjection(resultCode, data)
-        mediaProjection?.registerCallback(projectionCallback, null)
+    // ── MediaProjection capture ───────────────────────────────────────────
 
-        captureHandlerThread = HandlerThread("ScreenCapture").apply { start() }
-        captureHandler = Handler(captureHandlerThread!!.looper)
+    private fun startCapture(resultCode: Int, resultData: Intent) {
+        val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
+                as MediaProjectionManager
 
-        val captureWidth = (screenWidth * 0.8).toInt().let { if (it % 2 == 0) it else it - 1 }
-        val captureHeight = (screenHeight * 0.8).toInt().let { if (it % 2 == 0) it else it - 1 }
+        // getMediaProjection() returns MediaProjection? — unwrap safely with ?: return
+        val projection: MediaProjection =
+            mpManager.getMediaProjection(resultCode, resultData)
+                ?: run {
+                    Log.e(TAG, "getMediaProjection returned null — aborting capture")
+                    broadcastEventToRN("onCaptureError", "Failed to obtain MediaProjection")
+                    stopSelf()
+                    return
+                }
 
-        imageReader = ImageReader.newInstance(captureWidth, captureHeight, PixelFormat.RGBA_8888, 2)
-
-        imageReader!!.setOnImageAvailableListener({ reader ->
-            val now = System.currentTimeMillis()
-            if (now - lastFrameTime < frameIntervalMs) {
-                reader.acquireLatestImage()?.close()
-                return@setOnImageAvailableListener
+        // projection is non-null from here — no !! or ?. required on it
+        projection.registerCallback(object : MediaProjection.Callback() {
+            override fun onStop() {
+                Log.w(TAG, "MediaProjection stopped by system")
+                stopCapture()
             }
-            lastFrameTime = now
-            processFrame(reader)
         }, captureHandler)
 
-        virtualDisplay = mediaProjection!!.createVirtualDisplay(
-            "MediMirror",
-            captureWidth,
-            captureHeight,
-            screenDensity,
+        mediaProjection = projection
+
+        val captureWidth  = (screenWidth  * 0.75).toInt()
+        val captureHeight = (screenHeight * 0.75).toInt()
+
+        imageReader = ImageReader.newInstance(
+            captureWidth, captureHeight, PixelFormat.RGBA_8888, 2
+        ).apply {
+            setOnImageAvailableListener({ reader ->
+                if (!isCapturing.get()) return@setOnImageAvailableListener
+                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                try {
+                    val plane       = image.planes[0]
+                    val buffer      = plane.buffer
+                    val pixelStride = plane.pixelStride
+                    val rowStride   = plane.rowStride
+                    val rowPadding  = rowStride - pixelStride * captureWidth
+
+                    val bmp = Bitmap.createBitmap(
+                        captureWidth + rowPadding / pixelStride,
+                        captureHeight,
+                        Bitmap.Config.ARGB_8888
+                    )
+                    bmp.copyPixelsFromBuffer(buffer)
+
+                    val cropped = Bitmap.createBitmap(bmp, 0, 0, captureWidth, captureHeight)
+                    bmp.recycle()
+
+                    val out = ByteArrayOutputStream()
+                    cropped.compress(Bitmap.CompressFormat.JPEG, 60, out)
+                    cropped.recycle()
+
+                    streamingServer?.broadcastFrame(out.toByteArray())
+                } catch (e: Exception) {
+                    Log.e(TAG, "Frame error: ${e.message}")
+                } finally {
+                    image.close()
+                }
+            }, captureHandler)
+        }
+
+        virtualDisplay = projection.createVirtualDisplay(
+            "GPMS_Mirror",
+            captureWidth, captureHeight, screenDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
             imageReader!!.surface,
             null,
@@ -190,161 +266,53 @@ class ScreenCaptureService : Service() {
         )
 
         isCapturing.set(true)
-        Log.d(TAG, "Screen capture started: ${captureWidth}x${captureHeight}")
+        broadcastEventToRN("onCaptureStarted", "ok")
+        Log.d(TAG, "Capture started: ${captureWidth}x${captureHeight}")
     }
 
-    private fun processFrame(reader: ImageReader) {
-        var image: Image? = null
-        try {
-            image = reader.acquireLatestImage() ?: return
-
-            val planes = image.planes
-            val buffer = planes[0].buffer
-            val pixelStride = planes[0].pixelStride
-            val rowStride = planes[0].rowStride
-            val rowPadding = rowStride - pixelStride * image.width
-
-            val bitmapWidth = image.width + rowPadding / pixelStride
-            val bitmap = Bitmap.createBitmap(bitmapWidth, image.height, Bitmap.Config.ARGB_8888)
-            bitmap.copyPixelsFromBuffer(buffer)
-
-            val finalBitmap = if (rowPadding > 0) {
-                Bitmap.createBitmap(bitmap, 0, 0, image.width, image.height).also {
-                    bitmap.recycle()
-                }
-            } else bitmap
-
-            val out = ByteArrayOutputStream(65536)
-            finalBitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
-            finalBitmap.recycle()
-
-            streamingServer?.broadcastFrame(out.toByteArray())
-        } catch (e: Exception) {
-            Log.e(TAG, "Frame processing error", e)
-        } finally {
-            image?.close()
-        }
-    }
-
-    private fun handleControlCommand(json: JSONObject) {
-        try {
-            when (json.getString("type")) {
-                "touch" -> {
-                    val action = json.getString("action")
-                    val x = json.getDouble("x").toFloat()
-                    val y = json.getDouble("y").toFloat()
-                    MirrorAccessibilityService.performTouch(action, x, y,
-                        json.optLong("duration", 50L))
-                }
-                "swipe" -> {
-                    MirrorAccessibilityService.performSwipe(
-                        json.getDouble("startX").toFloat(),
-                        json.getDouble("startY").toFloat(),
-                        json.getDouble("endX").toFloat(),
-                        json.getDouble("endY").toFloat(),
-                        json.optLong("duration", 300L)
-                    )
-                }
-                "key" -> {
-                    when (json.getString("action")) {
-                        "back" -> MirrorAccessibilityService.performBack()
-                        "home" -> MirrorAccessibilityService.performHome()
-                        "recents" -> MirrorAccessibilityService.performRecents()
-                        "power" -> MirrorAccessibilityService.performPowerDialog()
-                        "notifications" -> MirrorAccessibilityService.performNotifications()
-                    }
-                }
-                "ping" -> {
-                    streamingServer?.broadcastSystemMessage("pong")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Control command error", e)
-        }
-    }
+    // ── Stop ──────────────────────────────────────────────────────────────
 
     private fun stopCapture() {
-        isCapturing.set(false)
-        virtualDisplay?.release()
-        virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
-        mediaProjection?.stop()
+        if (!isCapturing.getAndSet(false)) return
+
+        _isRunning.set(false)
+
+        runCatching { virtualDisplay?.release()     }
+        runCatching { imageReader?.close()          }
+        runCatching { mediaProjection?.stop()       }
+        runCatching { streamingServer?.stopServer() }
+
+        virtualDisplay  = null
+        imageReader     = null
         mediaProjection = null
-        captureHandlerThread?.quitSafely()
-        captureHandlerThread = null
-        streamingServer?.stopServer()
         streamingServer = null
-    }
 
-    private fun startForegroundWithNotification(shareCode: String) {
-        val notifIntent = Intent(this, MainActivity::class.java)
-        val pendingIntent = PendingIntent.getActivity(
-            this, 0, notifIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-        val stopIntent = Intent(this, ScreenCaptureService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPending = PendingIntent.getService(
-            this, 1, stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
+        broadcastEventToRN("onCaptureStopped", "ok")
 
-        val notification = NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
-            .setContentTitle("MediMirror Active")
-            .setContentText("Sharing screen • Code: $shareCode")
-            .setSmallIcon(android.R.drawable.ic_menu_share)
-            .setContentIntent(pendingIntent)
-            .addAction(android.R.drawable.ic_delete, "Stop", stopPending)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .setOngoing(true)
-            .build()
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
-            startForeground(NOTIFICATION_ID, notification)
+            @Suppress("DEPRECATION")
+            stopForeground(true)
         }
+
+        stopSelf()
+        Log.d(TAG, "Capture stopped")
     }
 
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            NOTIFICATION_CHANNEL_ID,
-            "Screen Sharing",
-            NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Active screen sharing notification"
-            setShowBadge(false)
-        }
-        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        nm.createNotificationChannel(channel)
+    // ── Control command dispatcher ────────────────────────────────────────
+
+    private fun handleControlCommand(json: org.json.JSONObject) {
+        sendBroadcast(Intent("com.leadwinner.gpms_standard.CONTROL_COMMAND").apply {
+            putExtra("command", json.toString())
+        })
     }
 
-    private fun acquireWakeLock() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "MediMirror:CaptureLock"
-        ).apply { acquire(3600000L) }
-    }
+    // ── RN event bridge ───────────────────────────────────────────────────
+    // Events are enqueued here; MirrorModule drains the queue every 500 ms.
+    // This avoids the ReactContext threading constraints from a background thread.
 
     private fun broadcastEventToRN(event: String, data: String) {
-        // pendingEvents is now correctly in the single companion object above
         pendingEvents.add(Pair(event, data))
     }
-
-    override fun onBind(intent: Intent?): IBinder? = null
-
-    override fun onDestroy() {
-        super.onDestroy()
-        stopCapture()
-        serviceScope.cancel()
-        wakeLock?.let { if (it.isHeld) it.release() }
-        instance = null
-        Log.d(TAG, "ScreenCaptureService destroyed")
-    }
-
-    // *** NO second companion object here — that was the root cause of the conflict ***
 }
