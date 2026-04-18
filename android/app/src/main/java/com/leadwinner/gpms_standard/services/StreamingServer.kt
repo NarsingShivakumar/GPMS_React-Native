@@ -19,22 +19,25 @@ import java.util.concurrent.atomic.AtomicBoolean
  * SERVER → CLIENT:
  *   { type:"hello",          width, height, deviceName }   ← sent immediately on connect
  *   { type:"connecting_ack"                             }   ← after client sends "ready"
- *   { type:"frame",          data, ts, w, h             }   ← JPEG stream
+ *   { type:"frame",          data, ts, w, h             }   ← JPEG stream frames
  *   { type:"pong",           ts                         }   ← reply to client ping
  *   { type:"server_ping",    ts                         }   ← proactive health check
  *
  * CLIENT → SERVER:
- *   { type:"ping",   ts }
- *   { type:"ready"      }   ← client finished loading, ready to receive stream
- *   { type:"touch",  action, x, y [,duration] }
- *   { type:"swipe",  startX, startY, endX, endY, duration }
- *   { type:"key",    action }
+ *   { type:"ping",      ts }
+ *   { type:"ready"         }   ← client finished loading, ready to receive stream
+ *   { type:"touch",     action, x, y [,duration] }
+ *   { type:"swipe",     startX, startY, endX, endY, duration }
+ *   { type:"longpress", x, y }
+ *   { type:"pinch",     cx, cy, scale, duration }
+ *   { type:"key",       action }
+ *   { type:"client_pong", ts }
  */
 class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
 
     companion object {
-        private const val TAG = "StreamingServer"
-        const val DEFAULT_PORT = 8765
+        private const val TAG              = "StreamingServer"
+        const val DEFAULT_PORT             = 8765
         private const val PING_TIMEOUT_MS  = 15_000L
         private const val PING_INTERVAL_MS = 5_000L
     }
@@ -49,15 +52,22 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
     var onControlCommand:     ((JSONObject) -> Unit)? = null
     var onClientConnected:    ((String) -> Unit)?     = null
     var onClientDisconnected: ((String) -> Unit)?     = null
-    var onClientAcknowledged: ((String) -> Unit)?     = null  // ← NEW: fired after connecting_ack sent
+    var onClientAcknowledged: ((String) -> Unit)?     = null
     var onServerStarted:      (() -> Unit)?           = null
     var onServerError:        ((Exception) -> Unit)?  = null
 
+    // ── Screen info ───────────────────────────────────────────────────────
     private var screenWidth  = 0
     private var screenHeight = 0
     private var deviceName   = ""
 
-    // ── WebSocketServer callbacks ─────────────────────────────────────────
+    // ── Frame buffer ──────────────────────────────────────────────────────
+    // Caches the last valid JPEG so a newly-connected viewer gets an
+    // immediate frame instead of a black screen while waiting for the
+    // next capture tick.
+    @Volatile private var lastValidFrame: ByteArray? = null
+
+    // ── WebSocketServer overrides ─────────────────────────────────────────
 
     override fun onOpen(conn: WebSocket, handshake: ClientHandshake) {
         clients.add(conn)
@@ -65,13 +75,14 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
         val addr = conn.remoteSocketAddress?.address?.hostAddress ?: "unknown"
         Log.d(TAG, "Client connected: $addr (total ${clients.size})")
 
-        // Step 1 — immediately send screen dimensions to viewer
+        // Send screen dimensions immediately — viewer needs these to
+        // render the correct aspect ratio before the first frame arrives.
         if (screenWidth > 0 && screenHeight > 0) {
             runCatching {
                 conn.send(JSONObject().apply {
-                    put("type", "hello")
-                    put("width", screenWidth)
-                    put("height", screenHeight)
+                    put("type",       "hello")
+                    put("width",      screenWidth)
+                    put("height",     screenHeight)
                     put("deviceName", deviceName)
                 }.toString())
             }
@@ -94,7 +105,7 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
 
             when (json.optString("type")) {
 
-                // ── Client ping → reply with pong ────────────────────────
+                // ── Ping → Pong ───────────────────────────────────────────
                 "ping" -> {
                     runCatching {
                         conn.send(JSONObject().apply {
@@ -104,24 +115,47 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
                     }
                 }
 
-                // ── Client ready → send connecting_ack + fire callback ───
-                // This is the handshake completion step. Both devices exit
-                // their loading screens when this exchange completes.
+                // ── Handshake completion ──────────────────────────────────
+                // Sequence:
+                //   1. Server sends "hello" (in onOpen)
+                //   2. Client sends "ready"
+                //   3. Server sends "connecting_ack"  ← loading screen hides on BOTH devices
+                //   4. Server immediately replays lastValidFrame ← no black wait
                 "ready" -> {
+                    // Step 3 — confirm handshake
                     runCatching {
                         conn.send(JSONObject().apply {
                             put("type", "connecting_ack")
                         }.toString())
                     }
+
+                    // Step 4 — replay last valid frame immediately so the viewer
+                    // never sees a black screen while waiting for the next capture tick.
+                    // Without this, on a static host screen the viewer could wait
+                    // hundreds of ms (or forever if the host screen is idle).
+                    lastValidFrame?.let { frame ->
+                        runCatching {
+                            conn.send(JSONObject().apply {
+                                put("type", "frame")
+                                put("data", Base64.encodeToString(frame, Base64.NO_WRAP))
+                                put("ts",   System.currentTimeMillis())
+                                put("w",    screenWidth)
+                                put("h",    screenHeight)
+                            }.toString())
+                        }.onFailure { Log.w(TAG, "Failed to replay last frame: ${it.message}") }
+                    }
+
                     val addr = conn.remoteSocketAddress?.address?.hostAddress ?: "unknown"
-                    onClientAcknowledged?.invoke(addr)   // ← fires onClientAcknowledged event
-                    Log.d(TAG, "Client ready, sent connecting_ack to $addr")
+                    onClientAcknowledged?.invoke(addr)
+                    Log.d(TAG, "Client ready — sent connecting_ack + frame replay to $addr")
                 }
 
-                // ── Reply to server's health-check ping ──────────────────
-                "client_pong" -> { /* lastSeen already updated above — no-op */ }
+                // ── Health-check pong from client ─────────────────────────
+                // lastSeen already updated at the top — nothing else to do.
+                "client_pong" -> { /* no-op */ }
 
-                // ── All touch/key/swipe commands → AccessibilityService ──
+                // ── All control commands → AccessibilityService ───────────
+                // Covers: touch, swipe, longpress, pinch, key
                 else -> onControlCommand?.invoke(json)
             }
         }.onFailure { Log.e(TAG, "Bad message: $message", it) }
@@ -134,11 +168,12 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
 
     override fun onStart() {
         isRunning.set(true)
-        connectionLostTimeout = 30  // seconds — was 60, halved for faster dead-client detection
+        connectionLostTimeout = 30
         Log.d(TAG, "WebSocket server started on port $port")
         onServerStarted?.invoke()
 
-        // Proactive server-side ping — closes stale/dead clients within PING_TIMEOUT_MS
+        // Proactive ping loop — detects dead clients within PING_TIMEOUT_MS
+        // without waiting for a TCP RST that may never arrive on LAN.
         pingJob = scheduler.scheduleAtFixedRate({
             val now = System.currentTimeMillis()
             clients.forEach { ws ->
@@ -151,7 +186,7 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
                     runCatching {
                         ws.send(JSONObject().apply {
                             put("type", "server_ping")
-                            put("ts", now)
+                            put("ts",   now)
                         }.toString())
                     }
                 }
@@ -162,20 +197,26 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
     // ── Public API ────────────────────────────────────────────────────────
 
     fun setDeviceInfo(width: Int, height: Int, name: String) {
-        screenWidth = width
+        screenWidth  = width
         screenHeight = height
-        deviceName = name
+        deviceName   = name
     }
 
+    /**
+     * Broadcast a validated JPEG frame to all connected viewers.
+     * Also caches it as [lastValidFrame] so newly-connected viewers
+     * receive an instant frame on handshake (see "ready" handler above).
+     */
     fun broadcastFrame(jpegBytes: ByteArray) {
         if (clients.isEmpty() || !isRunning.get()) return
+        lastValidFrame = jpegBytes          // ← cache before broadcast
         runCatching {
             broadcast(JSONObject().apply {
                 put("type", "frame")
                 put("data", Base64.encodeToString(jpegBytes, Base64.NO_WRAP))
-                put("ts", System.currentTimeMillis())
-                put("w", screenWidth)
-                put("h", screenHeight)
+                put("ts",   System.currentTimeMillis())
+                put("w",    screenWidth)
+                put("h",    screenHeight)
             }.toString())
         }.onFailure { Log.e(TAG, "Broadcast error", it) }
     }
@@ -189,11 +230,12 @@ class StreamingServer(port: Int) : WebSocketServer(InetSocketAddress(port)) {
         }.onFailure { Log.e(TAG, "System message error", it) }
     }
 
-    fun getClientCount() = clients.size
-    fun isServerRunning() = isRunning.get()
+    fun getClientCount()   = clients.size
+    fun isServerRunning()  = isRunning.get()
 
     fun stopServer() {
         isRunning.set(false)
+        lastValidFrame = null               // free memory on stop
         pingJob?.cancel(false)
         scheduler.shutdownNow()
         runCatching { stop(1000) }

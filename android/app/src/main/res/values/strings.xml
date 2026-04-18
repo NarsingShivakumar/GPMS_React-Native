@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">GPMS_ReactNative</string>
-<string name="accessibility_service_label">MediMirror Remote Control</string>
-<string name="accessibility_service_description">Allows remote control of this device via MediMirror. Used for screen mirroring and remote assistance in healthcare settings.</string>
+    <string name="accessibility_service_label">GPMS Screen Mirror Control</string>
+    <string name="accessibility_service_description">Allows GPMS to control the host screen for remote mirroring sessions.</string>
 </resources>

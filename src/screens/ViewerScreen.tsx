@@ -2,7 +2,8 @@
 import React, { useEffect, useRef, useCallback, useState } from 'react';
 import {
   View, Text, StyleSheet, PanResponder, GestureResponderEvent,
-  TouchableOpacity, Animated, Dimensions, StatusBar, ActivityIndicator,
+  PanResponderGestureState, TouchableOpacity, Animated, Dimensions,
+  StatusBar, ActivityIndicator, LayoutRectangle,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import FastImage from '@d11/react-native-fast-image';
@@ -20,6 +21,13 @@ import type { RootStackParamList } from '../navigation/AppNavigator';
 type ViewerRoute = RouteProp<RootStackParamList, 'Viewer'>;
 const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
 
+// ─── Constants ────────────────────────────────────────────────────────────────
+const TAP_MAX_MOVE_PX = 8;
+const TAP_MAX_DURATION_MS = 350;
+const LONG_PRESS_MS = 650;
+const MOVE_THROTTLE_MS = 16;   // ~60 fps cap for drag events
+const PINCH_MIN_DELTA_PX = 20;
+
 export default function ViewerScreen() {
   const route = useRoute<ViewerRoute>();
   const nav = useNavigation<any>();
@@ -29,53 +37,237 @@ export default function ViewerScreen() {
   const { host, port, shareCode, deviceName } = route.params;
   const wsUrl = `ws://${host}:${port}`;
 
-  const { latestFrameUri, remoteWidth, remoteHeight, fps } = useAppSelector(s => s.stream);
-  const { latency, reconnectAttempts } = useAppSelector(s => s.connection);
+  const { latestFrameUri, remoteWidth, remoteHeight, fps } =
+    useAppSelector(s => s.stream);
+  const { latency, reconnectAttempts } =
+    useAppSelector(s => s.connection);
 
+  // ─── UI state ──────────────────────────────────────────────────────────────
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [viewLayout, setViewLayout] = useState<LayoutRectangle | null>(null);
+
   const controlsTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const controlsAnim = useRef(new Animated.Value(1)).current;
   const connBadgeAnim = useRef(new Animated.Value(0)).current;
-  const frameLayout = useRef({ x: 0, y: 0, w: SCREEN_W, h: SCREEN_H });
 
-  // ─── WebSocket (with connection-phase awareness) ───────────────────────────
-  const { sendTouch, sendSwipe, sendKey, disconnect, wsStatus, connPhase } = useWebSocket({
+  // ─── Touch ripple ──────────────────────────────────────────────────────────
+  const [ripplePos, setRipplePos] = useState<{ x: number; y: number } | null>(null);
+  const rippleAnim = useRef(new Animated.Value(0)).current;
+
+  const showRipple = useCallback((px: number, py: number) => {
+    setRipplePos({ x: px, y: py });
+    rippleAnim.setValue(1);
+    Animated.timing(rippleAnim, {
+      toValue: 0, duration: 400, useNativeDriver: true,
+    }).start(() => setRipplePos(null));
+  }, [rippleAnim]);
+
+  // ─── Double-buffer state ───────────────────────────────────────────────────
+  // Two FastImage slots (A and B) alternate as the "active" display slot.
+  // The inactive slot loads the new frame off-screen; once onLoad fires we
+  // flip activeSlot — the previous frame stays visible until the new one is
+  // GPU-ready, completely eliminating the black flash between frames.
+  const activeSlot = useRef<'A' | 'B'>('A');
+  const [slotA, setSlotA] = useState<string | null>(null);
+  const [slotB, setSlotB] = useState<string | null>(null);
+  // pendingSlot tracks which slot is currently loading a new frame
+  const pendingSlot = useRef<'A' | 'B' | null>(null);
+
+  // Feed new frames into the inactive slot
+  useEffect(() => {
+    if (!latestFrameUri) return;
+    if (activeSlot.current === 'A') {
+      // Active is A → load into B
+      pendingSlot.current = 'B';
+      setSlotB(latestFrameUri);
+    } else {
+      // Active is B → load into A
+      pendingSlot.current = 'A';
+      setSlotA(latestFrameUri);
+    }
+  }, [latestFrameUri]);
+
+  // Called by the inactive FastImage once its frame is fully decoded
+  const handleFrameLoaded = useCallback((slot: 'A' | 'B') => {
+    if (slot !== activeSlot.current && slot === pendingSlot.current) {
+      // Swap: new slot becomes active, clear the old slot's URI to free memory
+      const prev = activeSlot.current;
+      activeSlot.current = slot;
+      pendingSlot.current = null;
+      if (prev === 'A') setSlotA(null);
+      else setSlotB(null);
+    }
+  }, []);
+
+  // ─── WebSocket ─────────────────────────────────────────────────────────────
+  const {
+    sendTouch, sendSwipe, sendKey, sendMessage,
+    disconnect, wsStatus, connPhase,
+  } = useWebSocket({
     url: wsUrl,
     enabled: true,
     onConnect: () => {
       showConnectBadge();
       scheduleHideControls();
     },
-    onDisconnect: () => {
-      dispatch(setStatus('reconnecting'));
-    },
+    onDisconnect: () => dispatch(setStatus('reconnecting')),
     onPhaseChange: (phase) => {
-      // Transition both devices out of loading screen only when
-      // the full connecting_ack handshake completes (phase === 'ready').
       if (phase === 'ready') dispatch(setStatus('connected'));
     },
   });
 
-  // true only after connecting_ack received — drives the loading overlay
   const isReady = connPhase === 'ready';
 
-  // ─── Frame layout (scale remote coords) ────────────────────────────────────
-  useEffect(() => {
-    if (remoteWidth > 0 && remoteHeight > 0) {
-      const aspect = remoteWidth / remoteHeight;
-      let w = SCREEN_W;
-      let h = SCREEN_W / aspect;
-      if (h > SCREEN_H) { h = SCREEN_H; w = SCREEN_H * aspect; }
-      frameLayout.current = {
-        x: (SCREEN_W - w) / 2,
-        y: (SCREEN_H - h) / 2,
-        w,
-        h,
-      };
+  // ─── Coordinate mapping ────────────────────────────────────────────────────
+  // Normalises controller screen coords (0..1) so the host can scale them
+  // back to its own resolution — works across different screen sizes.
+  const toNorm = useCallback((px: number, py: number): [number, number] => {
+    if (!viewLayout || viewLayout.width === 0 || viewLayout.height === 0) {
+      return [0.5, 0.5];
     }
-  }, [remoteWidth, remoteHeight]);
+    const nx = Math.max(0, Math.min(1, (px - viewLayout.x) / viewLayout.width));
+    const ny = Math.max(0, Math.min(1, (py - viewLayout.y) / viewLayout.height));
+    return [nx, ny];
+  }, [viewLayout]);
 
-  // ─── Animations ─────────────────────────────────────────────────────────────
+  // ─── Gesture state refs ─────────────────────────────────────────────────────
+  const tapStartRef = useRef<{ x: number; y: number; t: number; moved: boolean } | null>(null);
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastMoveTimeRef = useRef(0);
+  const pinchStartDistRef = useRef<number | null>(null);
+  const isDraggingRef = useRef(false);
+
+  const clearLongPress = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  // ─── PanResponder ──────────────────────────────────────────────────────────
+  const panResponder = useRef(
+    PanResponder.create({
+
+      onStartShouldSetPanResponder: () => isReady,
+      onStartShouldSetPanResponderCapture: () => isReady,
+      onMoveShouldSetPanResponder: (_, g) =>
+        isReady && (Math.abs(g.dx) > 3 || Math.abs(g.dy) > 3),
+      onMoveShouldSetPanResponderCapture: (_, g) =>
+        isReady && (Math.abs(g.dx) > 3 || Math.abs(g.dy) > 3),
+
+      // ── TOUCH DOWN ───────────────────────────────────────────────────────
+      onPanResponderGrant: (evt: GestureResponderEvent) => {
+        revealControls();
+        const touches = evt.nativeEvent.touches;
+
+        if (touches.length >= 2) {
+          const dx = touches[1].pageX - touches[0].pageX;
+          const dy = touches[1].pageY - touches[0].pageY;
+          pinchStartDistRef.current = Math.sqrt(dx * dx + dy * dy);
+          clearLongPress();
+          return;
+        }
+
+        const { pageX, pageY } = evt.nativeEvent;
+        isDraggingRef.current = false;
+        tapStartRef.current = { x: pageX, y: pageY, t: Date.now(), moved: false };
+
+        longPressTimerRef.current = setTimeout(() => {
+          if (tapStartRef.current && !tapStartRef.current.moved) {
+            tapStartRef.current.moved = true;
+            const [nx, ny] = toNorm(pageX, pageY);
+            sendMessage({ type: 'longpress', x: nx, y: ny });
+            showRipple(pageX, pageY);
+          }
+        }, LONG_PRESS_MS);
+      },
+
+      // ── TOUCH MOVE ───────────────────────────────────────────────────────
+      onPanResponderMove: (evt: GestureResponderEvent, gs: PanResponderGestureState) => {
+        const touches = evt.nativeEvent.touches;
+
+        // Pinch / zoom — two fingers
+        if (touches.length >= 2 && pinchStartDistRef.current !== null) {
+          const dx = touches[1].pageX - touches[0].pageX;
+          const dy = touches[1].pageY - touches[0].pageY;
+          const dist = Math.sqrt(dx * dx + dy * dy);
+          const delta = dist - pinchStartDistRef.current;
+
+          if (Math.abs(delta) > PINCH_MIN_DELTA_PX) {
+            const scale = dist / pinchStartDistRef.current;
+            const cx = (touches[0].pageX + touches[1].pageX) / 2;
+            const cy = (touches[0].pageY + touches[1].pageY) / 2;
+            const [ncx, ncy] = toNorm(cx, cy);
+            sendMessage({ type: 'pinch', cx: ncx, cy: ncy, scale, duration: 350 });
+            pinchStartDistRef.current = dist;
+          }
+          return;
+        }
+
+        // Single-finger drag
+        const state = tapStartRef.current;
+        if (!state) return;
+
+        const now = Date.now();
+        if (now - lastMoveTimeRef.current < MOVE_THROTTLE_MS) return;
+        lastMoveTimeRef.current = now;
+
+        const totalMove = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy);
+        if (totalMove > TAP_MAX_MOVE_PX) {
+          if (!state.moved) {
+            state.moved = true;
+            isDraggingRef.current = true;
+            clearLongPress();
+          }
+          const [nx, ny] = toNorm(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
+          sendTouch('down', nx, ny);
+        }
+      },
+
+      // ── TOUCH UP ─────────────────────────────────────────────────────────
+      onPanResponderRelease: (evt: GestureResponderEvent, gs: PanResponderGestureState) => {
+        clearLongPress();
+        pinchStartDistRef.current = null;
+
+        const state = tapStartRef.current;
+        tapStartRef.current = null;
+        if (!state) return;
+
+        const elapsed = Date.now() - state.t;
+        const totalMove = Math.sqrt(gs.dx * gs.dx + gs.dy * gs.dy);
+        const moved = state.moved || totalMove > TAP_MAX_MOVE_PX;
+
+        if (!moved && elapsed < TAP_MAX_DURATION_MS) {
+          // Tap
+          const [nx, ny] = toNorm(state.x, state.y);
+          sendTouch('tap', nx, ny, 50);
+          showRipple(state.x, state.y);
+        } else if (moved && isDraggingRef.current) {
+          // Swipe / drag
+          const [sx, sy] = toNorm(state.x, state.y);
+          const [ex, ey] = toNorm(state.x + gs.dx, state.y + gs.dy);
+          sendSwipe(sx, sy, ex, ey, Math.max(80, Math.min(elapsed, 800)));
+        } else {
+          // Long-press already fired — send lift
+          const [nx, ny] = toNorm(evt.nativeEvent.pageX, evt.nativeEvent.pageY);
+          sendTouch('up', nx, ny);
+        }
+
+        isDraggingRef.current = false;
+      },
+
+      onPanResponderTerminate: () => {
+        clearLongPress();
+        pinchStartDistRef.current = null;
+        tapStartRef.current = null;
+        isDraggingRef.current = false;
+      },
+
+      onShouldBlockNativeResponder: () => true,
+    })
+  ).current;
+
+  // ─── Controls visibility ───────────────────────────────────────────────────
   const showConnectBadge = () => {
     Animated.sequence([
       Animated.timing(connBadgeAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
@@ -87,19 +279,23 @@ export default function ViewerScreen() {
   const scheduleHideControls = useCallback(() => {
     if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
     controlsTimerRef.current = setTimeout(() => {
-      Animated.timing(controlsAnim, { toValue: 0, duration: 300, useNativeDriver: true }).start();
+      Animated.timing(controlsAnim, {
+        toValue: 0, duration: 300, useNativeDriver: true,
+      }).start();
       setControlsVisible(false);
       dispatch(setShowControls(false));
     }, 4000);
-  }, [dispatch]);
+  }, [dispatch, controlsAnim]);
 
   const revealControls = useCallback(() => {
     if (controlsTimerRef.current) clearTimeout(controlsTimerRef.current);
-    Animated.timing(controlsAnim, { toValue: 1, duration: 200, useNativeDriver: true }).start();
+    Animated.timing(controlsAnim, {
+      toValue: 1, duration: 200, useNativeDriver: true,
+    }).start();
     setControlsVisible(true);
     dispatch(setShowControls(true));
     scheduleHideControls();
-  }, [dispatch, scheduleHideControls]);
+  }, [dispatch, scheduleHideControls, controlsAnim]);
 
   useEffect(() => {
     scheduleHideControls();
@@ -110,63 +306,7 @@ export default function ViewerScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ─── Touch → coordinate scaling ────────────────────────────────────────────
-  const scaleCoords = useCallback((tx: number, ty: number): [number, number] => {
-    if (remoteWidth <= 0 || remoteHeight <= 0) return [tx, ty];
-    const { x, y, w, h } = frameLayout.current;
-    return [
-      Math.max(0, Math.min(remoteWidth, (tx - x) * (remoteWidth / w))),
-      Math.max(0, Math.min(remoteHeight, (ty - y) * (remoteHeight / h))),
-    ];
-  }, [remoteWidth, remoteHeight]);
-
-  const tapStartRef = useRef<{ x: number; y: number; t: number } | null>(null);
-
-  const panResponder = PanResponder.create({
-    onStartShouldSetPanResponder: () => true,
-    onMoveShouldSetPanResponder: (_, g) => Math.abs(g.dx) > 5 || Math.abs(g.dy) > 5,
-
-    onPanResponderGrant: (e: GestureResponderEvent) => {
-      revealControls();
-      const { pageX, pageY } = e.nativeEvent;
-      tapStartRef.current = { x: pageX, y: pageY, t: Date.now() };
-      const [rx, ry] = scaleCoords(pageX, pageY);
-      sendTouch('down', rx, ry);
-    },
-
-    onPanResponderMove: (e: GestureResponderEvent) => {
-      // Forward live move events so long-press drags work correctly on host
-      if (!tapStartRef.current) return;
-      const [rx, ry] = scaleCoords(e.nativeEvent.pageX, e.nativeEvent.pageY);
-      sendTouch('down', rx, ry);
-    },
-
-    onPanResponderRelease: (e: GestureResponderEvent, g) => {
-      const start = tapStartRef.current;
-      if (!start) return;
-      const elapsed = Date.now() - start.t;
-      const dist = Math.sqrt(g.dx * g.dx + g.dy * g.dy);
-
-      if (dist < 8 && elapsed < 400) {
-        const [rx, ry] = scaleCoords(e.nativeEvent.pageX, e.nativeEvent.pageY);
-        sendTouch('tap', rx, ry, elapsed);
-      } else if (dist > 20) {
-        const [sx, sy] = scaleCoords(start.x, start.y);
-        const [ex, ey] = scaleCoords(e.nativeEvent.pageX, e.nativeEvent.pageY);
-        sendSwipe(sx, sy, ex, ey, Math.min(elapsed, 800));
-      } else {
-        const [rx, ry] = scaleCoords(e.nativeEvent.pageX, e.nativeEvent.pageY);
-        sendTouch('up', rx, ry);
-      }
-      tapStartRef.current = null;
-    },
-
-    onPanResponderTerminate: () => {
-      tapStartRef.current = null;
-    },
-  });
-
-  // ─── Disconnect handler ────────────────────────────────────────────────────
+  // ─── Disconnect ─────────────────────────────────────────────────────────────
   const handleDisconnect = useCallback(() => {
     disconnect();
     dispatch(resetConnection());
@@ -201,7 +341,6 @@ export default function ViewerScreen() {
     }
   };
 
-  // ─── Loading overlay helpers ───────────────────────────────────────────────
   const loadingTitle = () => {
     switch (connPhase) {
       case 'socket': return 'Connecting…';
@@ -218,12 +357,15 @@ export default function ViewerScreen() {
     return `Connecting to ${deviceName || host}`;
   };
 
+  // Whether either slot has content (stream has started)
+  const hasFrame = slotA !== null || slotB !== null;
+
   // ─── Render ─────────────────────────────────────────────────────────────────
   return (
-    <View style={styles.container} {...(isReady ? panResponder.panHandlers : {})}>
+    <View style={styles.container}>
       <StatusBar hidden />
 
-      {/* ── Loading overlay — shown until connecting_ack handshake completes ── */}
+      {/* ── Loading overlay — hidden only after connecting_ack ──────────────── */}
       {!isReady && (
         <View style={styles.loadingOverlay}>
           <View style={styles.loadingCard}>
@@ -260,7 +402,6 @@ export default function ViewerScreen() {
             )}
           </View>
 
-          {/* Allow cancel even from loading screen */}
           <TouchableOpacity style={styles.loadingDisconnect} onPress={handleDisconnect}>
             <Icon name="close-circle-outline" size={18} color={colors.textMuted} />
             <Text style={styles.loadingDisconnectText}>Cancel</Text>
@@ -268,45 +409,108 @@ export default function ViewerScreen() {
         </View>
       )}
 
-      {/* ── Live stream frame ─────────────────────────────────────────────── */}
-      {isReady && latestFrameUri ? (
-        <FastImage
-          style={styles.frame}
-          source={{ uri: latestFrameUri, priority: FastImage.priority.high }}
-          resizeMode={FastImage.resizeMode.contain}
-        />
-      ) : isReady ? (
-        <View style={styles.waitingFrame}>
-          <Icon name="monitor-shimmer" size={60} color={colors.textMuted} />
-          <Text style={styles.waitingText}>Waiting for first frame…</Text>
-          <View style={styles.reconnectDots}>
-            {[0, 1, 2].map(i => (
-              <DotBlink key={i} delay={i * 200} color={colors.primary} />
-            ))}
-          </View>
-        </View>
-      ) : null}
+      {/* ── Gesture + double-buffer stream layer ────────────────────────────── */}
+      {isReady && (
+        <View
+          style={styles.gestureLayer}
+          onLayout={(e) => setViewLayout(e.nativeEvent.layout)}
+          {...panResponder.panHandlers}
+        >
 
-      {/* ── Top HUD (only when stream is live) ───────────────────────────── */}
+          {/* ── Double-buffer frames ────────────────────────────────────────
+               Slot A and Slot B overlap absolutely.
+               Only the ACTIVE slot is visible (opacity 1); the inactive
+               slot loads the next frame at opacity 0 so Glide warms it on
+               the GPU. When onLoad fires on the inactive slot we flip
+               activeSlot — the previous frame stays on screen until the
+               next one is truly ready, eliminating the black flash.        */}
+
+          {slotA !== null && (
+            <FastImage
+              key="slotA"
+              style={[
+                styles.frame,
+                activeSlot.current !== 'A' && styles.frameHidden,
+              ]}
+              source={{ uri: slotA, priority: FastImage.priority.high }}
+              resizeMode={FastImage.resizeMode.contain}
+              onLoad={() => handleFrameLoaded('A')}
+              pointerEvents="none"
+            />
+          )}
+
+          {slotB !== null && (
+            <FastImage
+              key="slotB"
+              style={[
+                styles.frame,
+                activeSlot.current !== 'B' && styles.frameHidden,
+              ]}
+              source={{ uri: slotB, priority: FastImage.priority.high }}
+              resizeMode={FastImage.resizeMode.contain}
+              onLoad={() => handleFrameLoaded('B')}
+              pointerEvents="none"
+            />
+          )}
+
+          {/* Waiting state — shown when stream is live but no frame yet */}
+          {!hasFrame && (
+            <View style={styles.waitingFrame}>
+              <Icon name="monitor-shimmer" size={60} color={colors.textMuted} />
+              <Text style={styles.waitingText}>Waiting for first frame…</Text>
+              <View style={styles.reconnectDots}>
+                {[0, 1, 2].map(i => (
+                  <DotBlink key={i} delay={i * 200} color={colors.primary} />
+                ))}
+              </View>
+            </View>
+          )}
+
+          {/* Touch ripple — visual feedback for taps */}
+          {ripplePos && (
+            <Animated.View
+              pointerEvents="none"
+              style={[
+                styles.touchRipple,
+                {
+                  left: ripplePos.x - 22,
+                  top: ripplePos.y - 22,
+                  opacity: rippleAnim,
+                  transform: [{
+                    scale: rippleAnim.interpolate({
+                      inputRange: [0, 1],
+                      outputRange: [1.8, 0.6],
+                    }),
+                  }],
+                },
+              ]}
+            />
+          )}
+        </View>
+      )}
+
+      {/* ── Top HUD ─────────────────────────────────────────────────────────── */}
       {isReady && (
         <Animated.View
-          style={[
-            styles.topHUD,
-            { opacity: controlsAnim, pointerEvents: controlsVisible ? 'box-none' : 'none' },
-          ]}>
+          pointerEvents={controlsVisible ? 'box-none' : 'none'}
+          style={[styles.topHUD, { opacity: controlsAnim }]}
+        >
           <LinearGradient
-            colors={['rgba(5,13,31,0.9)', 'transparent']}
-            style={styles.topGradient}>
+            colors={['rgba(5,13,31,0.92)', 'transparent']}
+            style={styles.topGradient}
+          >
             <View style={styles.topRow}>
               <TouchableOpacity onPress={handleDisconnect} style={styles.hudBtn}>
                 <Icon name="close" size={22} color={palette.white} />
               </TouchableOpacity>
+
               <View style={styles.deviceInfo}>
                 <Icon name="monitor" size={14} color={colors.accent} />
                 <Text style={styles.deviceName} numberOfLines={1}>
                   {deviceName || host}
                 </Text>
               </View>
+
               <View style={styles.statusPill}>
                 <View style={[styles.statusDot, { backgroundColor: statusColor() }]} />
                 <Text style={styles.statusPillText}>{statusLabel()}</Text>
@@ -316,41 +520,65 @@ export default function ViewerScreen() {
         </Animated.View>
       )}
 
-      {/* ── Latency badge ────────────────────────────────────────────────── */}
+      {/* ── Latency badge ────────────────────────────────────────────────────── */}
       {isReady && wsStatus === 'connected' && latency > 0 && (
         <Animated.View
-          style={[styles.statsOverlay, { opacity: controlsAnim, pointerEvents: 'none' }]}>
+          pointerEvents="none"
+          style={[styles.statsOverlay, { opacity: controlsAnim }]}
+        >
           <Text style={styles.statText}>{latency}ms</Text>
         </Animated.View>
       )}
 
-      {/* ── Bottom control bar ───────────────────────────────────────────── */}
+      {/* ── Bottom system key bar ─────────────────────────────────────────────
+           Sits OUTSIDE gestureLayer so taps here are not forwarded to host.
+           Each button calls sendKey() directly.                              */}
       {isReady && (
         <Animated.View
           style={[
             styles.bottomBar,
             { opacity: controlsAnim, paddingBottom: insets.bottom + 8 },
-          ]}>
+          ]}
+          pointerEvents={controlsVisible ? 'box-none' : 'none'}
+        >
           <LinearGradient
             colors={['transparent', 'rgba(5,13,31,0.95)']}
-            style={styles.bottomGradient}>
+            style={styles.bottomGradient}
+          >
             <View style={styles.controlRow}>
-              <ControlButton icon="arrow-left-circle" label="Back" onPress={() => sendKey('back')} />
-              <ControlButton icon="circle-outline" label="Home" onPress={() => sendKey('home')} primary />
-              <ControlButton icon="view-grid" label="Recents" onPress={() => sendKey('recents')} />
-              <ControlButton icon="bell-outline" label="Notifs" onPress={() => sendKey('notifications')} />
+              <ControlButton
+                icon="view-grid"
+                label="Recents"
+                onPress={() => sendKey('recents')}
+              />
+              <ControlButton
+                icon="circle-outline"
+                label="Home"
+                onPress={() => sendKey('home')}
+                primary
+              />
+              <ControlButton
+                icon="arrow-left-circle"
+                label="Back"
+                onPress={() => sendKey('back')}
+              />
+              <ControlButton
+                icon="bell-outline"
+                label="Notifs"
+                onPress={() => sendKey('notifications')}
+              />
             </View>
           </LinearGradient>
         </Animated.View>
       )}
 
-      {/* ── Connected flash badge ─────────────────────────────────────────── */}
+      {/* ── Connected flash badge ─────────────────────────────────────────────── */}
       <Animated.View
+        pointerEvents="none"
         style={[
           styles.connBadge,
           {
             opacity: connBadgeAnim,
-            pointerEvents: 'none',
             transform: [{
               scale: connBadgeAnim.interpolate({
                 inputRange: [0, 1],
@@ -358,10 +586,12 @@ export default function ViewerScreen() {
               }),
             }],
           },
-        ]}>
+        ]}
+      >
         <LinearGradient
           colors={[`${colors.success}CC`, `${colors.success}88`]}
-          style={styles.connBadgeInner}>
+          style={styles.connBadgeInner}
+        >
           <Icon name="access-point-check" size={20} color={palette.white} />
           <Text style={styles.connBadgeText}>Connected</Text>
         </LinearGradient>
@@ -370,26 +600,23 @@ export default function ViewerScreen() {
   );
 }
 
-// ─── Sub-components ──────────────────────────────────────────────────────────
+// ─── Sub-components ───────────────────────────────────────────────────────────
 
 function LoadingStep({
   done, active, label,
 }: { done: boolean; active: boolean; label: string }) {
   return (
     <View style={lstyles.row}>
-      {done ? (
-        <Icon name="check-circle" size={16} color={colors.success} />
-      ) : active ? (
-        <ActivityIndicator size={14} color={colors.primary} />
-      ) : (
-        <Icon name="circle-outline" size={16} color={colors.textMuted} />
-      )}
-      <Text
-        style={[
-          lstyles.label,
-          done && { color: colors.success },
-          active && { color: palette.white },
-        ]}>
+      {done
+        ? <Icon name="check-circle" size={16} color={colors.success} />
+        : active
+          ? <ActivityIndicator size={14} color={colors.primary} />
+          : <Icon name="circle-outline" size={16} color={colors.textMuted} />}
+      <Text style={[
+        lstyles.label,
+        done && { color: colors.success },
+        active && { color: palette.white },
+      ]}>
         {label}
       </Text>
     </View>
@@ -397,24 +624,15 @@ function LoadingStep({
 }
 
 const lstyles = StyleSheet.create({
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: spacing.sm,
-    marginVertical: 3,
-  },
-  label: {
-    fontSize: typography.sm,
-    color: colors.textMuted,
-  },
+  row: { flexDirection: 'row', alignItems: 'center', gap: spacing.sm, marginVertical: 3 },
+  label: { fontSize: typography.sm, color: colors.textMuted },
 });
 
 function ControlButton({
   icon, label, onPress, primary = false,
-}: {
-  icon: string; label: string; onPress: () => void; primary?: boolean;
-}) {
+}: { icon: string; label: string; onPress: () => void; primary?: boolean }) {
   const scaleAnim = useRef(new Animated.Value(1)).current;
+
   const press = () => {
     Animated.sequence([
       Animated.timing(scaleAnim, { toValue: 0.88, duration: 80, useNativeDriver: true }),
@@ -422,17 +640,17 @@ function ControlButton({
     ]).start();
     onPress();
   };
+
   return (
     <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
       <TouchableOpacity onPress={press} style={styles.ctrlBtn} activeOpacity={0.85}>
-        <View
-          style={[
-            styles.ctrlIconWrap,
-            primary && {
-              backgroundColor: `${colors.primary}30`,
-              borderColor: `${colors.primary}50`,
-            },
-          ]}>
+        <View style={[
+          styles.ctrlIconWrap,
+          primary && {
+            backgroundColor: `${colors.primary}30`,
+            borderColor: `${colors.primary}50`,
+          },
+        ]}>
           <Icon
             name={icon}
             size={primary ? 26 : 22}
@@ -449,6 +667,7 @@ function ControlButton({
 
 function DotBlink({ delay, color }: { delay: number; color: string }) {
   const anim = useRef(new Animated.Value(0.3)).current;
+
   useEffect(() => {
     const loop = Animated.loop(
       Animated.sequence([
@@ -459,30 +678,52 @@ function DotBlink({ delay, color }: { delay: number; color: string }) {
     );
     loop.start();
     return () => loop.stop();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
   return (
-    <Animated.View
-      style={{
-        width: 8, height: 8, borderRadius: 4,
-        backgroundColor: color, opacity: anim, margin: 3,
-      }}
-    />
+    <Animated.View style={{
+      width: 8, height: 8, borderRadius: 4,
+      backgroundColor: color, opacity: anim, margin: 3,
+    }} />
   );
 }
 
-// ─── Styles ──────────────────────────────────────────────────────────────────
-
+// ─── Styles ───────────────────────────────────────────────────────────────────
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#000' },
 
-  // Stream frame
-  frame: { ...StyleSheet.absoluteFillObject },
+  // ── Gesture + stream layer ──────────────────────────────────────────────────
+  gestureLayer: {
+    ...StyleSheet.absoluteFillObject,
+  },
+
+  // Active frame — fully visible
+  frame: {
+    ...StyleSheet.absoluteFillObject,
+  },
+
+  // Inactive (loading) frame — invisible but still GPU-warm.
+  // opacity:0 keeps it off-screen without triggering a Glide teardown.
+  frameHidden: {
+    opacity: 0,
+  },
+
   waitingFrame: {
     flex: 1, alignItems: 'center', justifyContent: 'center', gap: spacing.base,
   },
   waitingText: { color: colors.textSecondary, fontSize: typography.base },
 
-  // Loading overlay
+  // ── Touch ripple ────────────────────────────────────────────────────────────
+  touchRipple: {
+    position: 'absolute',
+    width: 44, height: 44, borderRadius: 22,
+    backgroundColor: 'rgba(255,255,255,0.28)',
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.55)',
+  },
+
+  // ── Loading overlay ─────────────────────────────────────────────────────────
   loadingOverlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: palette.navy,
@@ -532,17 +773,18 @@ const styles = StyleSheet.create({
   },
   loadingDisconnectText: { color: colors.textMuted, fontSize: typography.sm },
 
-  // Reconnect dots
   reconnectDots: {
     flexDirection: 'row', alignItems: 'center', marginTop: spacing.xs,
   },
 
-  // Top HUD
-  topHUD: { position: 'absolute', top: 0, left: 0, right: 0 },
+  // ── Top HUD ─────────────────────────────────────────────────────────────────
+  topHUD: { position: 'absolute', top: 0, left: 0, right: 0, zIndex: 10 },
   topGradient: { paddingTop: 12, paddingBottom: 24 },
   topRow: {
-    flexDirection: 'row', alignItems: 'center',
-    paddingHorizontal: spacing.base, gap: spacing.sm,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: spacing.base,
+    gap: spacing.sm,
   },
   hudBtn: {
     width: 36, height: 36, borderRadius: 18,
@@ -573,16 +815,18 @@ const styles = StyleSheet.create({
     fontWeight: typography.medium as any,
   },
 
-  // Latency badge
-  statsOverlay: { position: 'absolute', top: 56, right: spacing.base },
+  // ── Latency ──────────────────────────────────────────────────────────────────
+  statsOverlay: { position: 'absolute', top: 56, right: spacing.base, zIndex: 10 },
   statText: { color: 'rgba(255,255,255,0.5)', fontSize: 10, fontFamily: 'monospace' },
 
-  // Bottom bar
-  bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0 },
+  // ── Bottom key bar ───────────────────────────────────────────────────────────
+  bottomBar: { position: 'absolute', bottom: 0, left: 0, right: 0, zIndex: 10 },
   bottomGradient: { paddingTop: 32 },
   controlRow: {
-    flexDirection: 'row', justifyContent: 'space-evenly',
-    paddingHorizontal: spacing.lg, paddingBottom: spacing.sm,
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
+    paddingHorizontal: spacing.lg,
+    paddingBottom: spacing.sm,
   },
   ctrlBtn: { alignItems: 'center', gap: 4 },
   ctrlIconWrap: {
@@ -591,16 +835,22 @@ const styles = StyleSheet.create({
     borderWidth: 1, borderColor: 'rgba(255,255,255,0.15)',
     alignItems: 'center', justifyContent: 'center',
   },
-  ctrlLabel: { color: colors.textMuted, fontSize: 10, fontWeight: typography.medium as any },
+  ctrlLabel: {
+    color: colors.textMuted,
+    fontSize: 10,
+    fontWeight: typography.medium as any,
+  },
 
-  // Connected flash badge
+  // ── Connected flash badge ─────────────────────────────────────────────────────
   connBadge: {
     position: 'absolute', top: '45%', alignSelf: 'center',
-    borderRadius: radii.xl, overflow: 'hidden', ...shadows.successGlow,
+    borderRadius: radii.xl, overflow: 'hidden', zIndex: 15,
+    ...shadows.successGlow,
   },
   connBadgeInner: {
     flexDirection: 'row', alignItems: 'center',
-    gap: spacing.sm, paddingHorizontal: spacing.xl, paddingVertical: spacing.md,
+    gap: spacing.sm,
+    paddingHorizontal: spacing.xl, paddingVertical: spacing.md,
   },
   connBadgeText: {
     color: palette.white,

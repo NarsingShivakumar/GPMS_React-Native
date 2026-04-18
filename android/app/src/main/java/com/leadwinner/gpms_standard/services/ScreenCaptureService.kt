@@ -197,22 +197,16 @@ class ScreenCaptureService : Service() {
         val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE)
                 as MediaProjectionManager
 
-        // getMediaProjection() returns MediaProjection? — unwrap safely with ?: return
         val projection: MediaProjection =
             mpManager.getMediaProjection(resultCode, resultData)
                 ?: run {
-                    Log.e(TAG, "getMediaProjection returned null — aborting capture")
+                    Log.e(TAG, "getMediaProjection returned null")
                     broadcastEventToRN("onCaptureError", "Failed to obtain MediaProjection")
-                    stopSelf()
-                    return
+                    stopSelf(); return
                 }
 
-        // projection is non-null from here — no !! or ?. required on it
         projection.registerCallback(object : MediaProjection.Callback() {
-            override fun onStop() {
-                Log.w(TAG, "MediaProjection stopped by system")
-                stopCapture()
-            }
+            override fun onStop() { stopCapture() }
         }, captureHandler)
 
         mediaProjection = projection
@@ -220,12 +214,31 @@ class ScreenCaptureService : Service() {
         val captureWidth  = (screenWidth  * 0.75).toInt()
         val captureHeight = (screenHeight * 0.75).toInt()
 
+        // ── FIX 1a: maxImages = 4 (was 2) ────────────────────────────────────
+        // With maxImages=2 a burst of frames (animation, keyboard open, transition)
+        // fills the queue; acquireLatestImage returns null → black frame.
+        // 4 gives enough headroom for 60fps bursts without unbounded memory.
         imageReader = ImageReader.newInstance(
-            captureWidth, captureHeight, PixelFormat.RGBA_8888, 2
+            captureWidth, captureHeight, PixelFormat.RGBA_8888, 8
         ).apply {
             setOnImageAvailableListener({ reader ->
                 if (!isCapturing.get()) return@setOnImageAvailableListener
-                val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+
+                // ── FIX 1b: drain the queue, keep ONLY the latest valid frame ─
+                // When multiple frames pile up, discard all but the newest.
+                // Never close without acquiring — closing an empty reader crashes.
+                var image: android.media.Image? = null
+                var candidate: android.media.Image?
+                do {
+                    candidate = reader.acquireNextImage()
+                    if (candidate != null) {
+                        image?.close()          // discard older frame
+                        image = candidate
+                    }
+                } while (candidate != null)
+
+                if (image == null) return@setOnImageAvailableListener
+
                 try {
                     val plane       = image.planes[0]
                     val buffer      = plane.buffer
@@ -240,14 +253,44 @@ class ScreenCaptureService : Service() {
                     )
                     bmp.copyPixelsFromBuffer(buffer)
 
+                    // ── FIX 1c: validate frame before broadcasting ─────────────
+                    // A transitioning screen (rotation, keyboard, nav bar change)
+                    // sometimes produces an all-black bitmap.
+                    // Check the centre pixel — if it is pure black, skip this frame.
+                    val cx = bmp.width  / 2
+                    val cy = bmp.height / 2
+                    val centrePixel = bmp.getPixel(cx, cy)
+                    if (centrePixel == android.graphics.Color.BLACK) {
+                        // Also sample 3 corners — if all black, truly a blank frame
+                        val corners = listOf(
+                            bmp.getPixel(10, 10),
+                            bmp.getPixel(bmp.width - 10, 10),
+                            bmp.getPixel(10, bmp.height - 10)
+                        )
+                        if (corners.all { it == android.graphics.Color.BLACK }) {
+                            bmp.recycle()
+                            return@setOnImageAvailableListener  // skip — do NOT broadcast
+                        }
+                    }
+
                     val cropped = Bitmap.createBitmap(bmp, 0, 0, captureWidth, captureHeight)
                     bmp.recycle()
 
                     val out = ByteArrayOutputStream()
-                    cropped.compress(Bitmap.CompressFormat.JPEG, 60, out)
+                    // ── FIX 1d: adaptive quality ──────────────────────────────
+                    // Use 70 quality (up from 60) — lower quality at 60 causes
+                    // JPEG block artifacts that look like flicker on text/UI edges.
+                    cropped.compress(Bitmap.CompressFormat.JPEG, 70, out)
                     cropped.recycle()
 
-                    streamingServer?.broadcastFrame(out.toByteArray())
+                    val bytes = out.toByteArray()
+                    // ── FIX 1e: minimum viable frame size guard ───────────────
+                    // A valid JPEG is never less than ~800 bytes.
+                    // An undersized payload means compression produced garbage.
+                    if (bytes.size > 800) {
+                        streamingServer?.broadcastFrame(bytes)
+                    }
+
                 } catch (e: Exception) {
                     Log.e(TAG, "Frame error: ${e.message}")
                 } finally {
@@ -260,16 +303,13 @@ class ScreenCaptureService : Service() {
             "GPMS_Mirror",
             captureWidth, captureHeight, screenDpi,
             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-            imageReader!!.surface,
-            null,
-            captureHandler
+            imageReader!!.surface, null, captureHandler
         )
 
         isCapturing.set(true)
         broadcastEventToRN("onCaptureStarted", "ok")
         Log.d(TAG, "Capture started: ${captureWidth}x${captureHeight}")
     }
-
     // ── Stop ──────────────────────────────────────────────────────────────
 
     private fun stopCapture() {
@@ -303,11 +343,16 @@ class ScreenCaptureService : Service() {
     // ── Control command dispatcher ────────────────────────────────────────
 
     private fun handleControlCommand(json: org.json.JSONObject) {
-        sendBroadcast(Intent("com.leadwinner.gpms_standard.CONTROL_COMMAND").apply {
+        // Route 1: direct call if AccessibilityService is in same process (fastest)
+        if (MirrorAccessibilityService.isEnabled()) {
+            MirrorAccessibilityService.dispatchCommand(json)
+            return
+        }
+        // Route 2: broadcast fallback (service may not have started yet)
+        sendBroadcast(Intent(MirrorAccessibilityService.ACTION_CONTROL).apply {
             putExtra("command", json.toString())
         })
     }
-
     // ── RN event bridge ───────────────────────────────────────────────────
     // Events are enqueued here; MirrorModule drains the queue every 500 ms.
     // This avoids the ReactContext threading constraints from a background thread.
