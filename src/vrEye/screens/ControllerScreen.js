@@ -1,25 +1,12 @@
 /**
- * ControllerScreen.js  v1.1  — FIXED
+ * ControllerScreen.js  v2.1  — Overlay fix + style cleanup
  *
- * Bug fixes from v1.0:
+ * Changes from v2.0:
  *
- * FIX 1 — Removed socketService entirely from controller
- *   The controller was connecting to the cloud socket as 'assistant' and
- *   emitting vr_join_session. This is WRONG — only the VR host (PatientScreen)
- *   joins the VR session. The controller has NO cloud socket connection.
- *   All session state comes from localPeerService (vr_state_update events).
- *
- * FIX 2 — Monitoring view activates from localPeer, not from cloud socket
- *   Previously 'monitoring' view only activated on socketService session_joined,
- *   which the controller never received. Now it activates when the VR host
- *   sends its first vr_state_update with phase !== 'waiting', OR explicitly
- *   via a new 'vr_session_started' peer message that PatientScreen sends
- *   when it successfully joins the VR session (session_joined from server).
- *
- * FIX 3 — startTest sends the message and immediately enters monitoring
- *   Controller no longer waits for any socket confirmation to show monitoring.
- *   It transitions to monitoring as soon as Begin Test is pressed (optimistic),
- *   since the VR host will immediately broadcast state updates.
+ * FIX 1 — Duplicate eyeCentreDivider style removed (was overriding itself)
+ * FIX 2 — Double-wrap overflow:hidden on EyePanel containers to fix
+ *          Android vignette/overlay bleed from AstigmatismTest & IshiharaTest
+ * FIX 3 — eyeScrollOuter / eyeScrollContent dead styles removed
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -29,9 +16,11 @@ import {
   KeyboardAvoidingView, Platform, Dimensions,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
-// import apiService from '../../AxiosClient';
 import localPeerService from '../services/localPeerService';
 import apiService from '../../api/AxiosClient';
+import EyePanel from '../components/EyePanel';
+// import apiService from '../../AxiosClient';
+import { generatePlateDots, getPlate, TOTAL_PLATES } from '../utils/ishiharaPanel';
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 const fetchActiveAssistantsApi = async () => {
@@ -56,7 +45,20 @@ const INIT_ALLERGIES = {
   allergySulpha: false, allergyAtropine: false, allergyDropsyn: false,
 };
 
+const PHASE_COLORS = {
+  waiting: '#444',
+  acuity: '#5b5bd6',
+  color: '#e91e63',
+  near: '#009688',
+  astigmatism: '#ff9800',
+  complete: '#4caf50',
+};
+
+// Dynamic eye panel size — always fits side-by-side on any screen
+// 16px left padding + 16px right padding + 2px divider + 4px gap between cards = 38px chrome
 const { width: W } = Dimensions.get('window');
+const EYE_W = Math.floor((W - 38) / 2);
+const EYE_H = Math.round(EYE_W * (4 / 3));
 
 export default function ControllerScreen({ route, navigation }) {
   // view: 'connecting' | 'registration' | 'ready' | 'monitoring'
@@ -108,54 +110,31 @@ export default function ControllerScreen({ route, navigation }) {
       setPeerReconnecting(false);
       setView(prev => prev === 'connecting' ? 'registration' : prev);
     }));
-
-    U.push(localPeerService.on('disconnected', () => {
-      setPeerConnected(false);
-    }));
-
-    U.push(localPeerService.on('reconnecting', ({ attempt }) => {
-      setPeerReconnecting(true);
-      setPeerConnected(false);
-    }));
-
+    U.push(localPeerService.on('disconnected', () => setPeerConnected(false)));
+    U.push(localPeerService.on('reconnecting', () => { setPeerReconnecting(true); setPeerConnected(false); }));
     U.push(localPeerService.on('ping_rtt', ({ rtt }) => setPeerRtt(rtt)));
 
-    // FIX 2: VR host broadcasts state; switch to monitoring on first real update
     U.push(localPeerService.on('vr_state_update', (state) => {
       setVrState(prev => ({ ...prev, ...state }));
-      // If VR host is now in an active phase, make sure we're in monitoring
       if (state.phase && state.phase !== 'waiting') {
         setView(prev => prev === 'ready' ? 'monitoring' : prev);
       }
     }));
 
-    // FIX 2: Explicit signal from VR host when it has joined the VR session
     U.push(localPeerService.on('vr_session_started', ({ patientName: pn }) => {
       if (pn) setPatientName(pn);
       setView('monitoring');
     }));
+    U.push(localPeerService.on('vr_session_ended', () => resetSession()));
 
-    U.push(localPeerService.on('vr_session_ended', () => {
-      resetSession();
-    }));
-
-    // If peer already connected when this screen mounts
-    if (localPeerService.isConnected()) {
-      setPeerConnected(true);
-      fetchAssistants();
-    }
+    if (localPeerService.isConnected()) { setPeerConnected(true); fetchAssistants(); }
 
     return () => { U.forEach(fn => fn()); unsubs.current = []; };
   }, []); // eslint-disable-line
 
-  // ── Helpers ───────────────────────────────────────────────────────────────
   const resetSession = useCallback(() => {
-    setView('registration');
-    setRoomCode('');
-    setRegStep('details');
-    setSelectedAssistantId('');
-    setSubmitError('');
-    setPatientName('');
+    setView('registration'); setRoomCode(''); setRegStep('details');
+    setSelectedAssistantId(''); setSubmitError(''); setPatientName('');
     setVrState({
       phase: 'waiting', instruction: 'Waiting\u2026',
       optotype: null, isComplete: false,
@@ -200,22 +179,17 @@ export default function ControllerScreen({ route, navigation }) {
       const res = await submitRegistrationApi(payload);
       const rc = res.roomCode;
       const pn = res.patientName ?? regName.trim();
-      setRoomCode(rc);
-      setPatientName(pn);
-      // Tell VR host the room code → it will connect and start the VR session
+      setRoomCode(rc); setPatientName(pn);
       localPeerService.send('session_registered', { roomCode: rc, patientName: pn });
       setView('ready');
     } catch (err) {
-      setSubmitError(
-        err?.response?.data?.message ?? err?.message ?? 'Could not start session.'
-      );
+      setSubmitError(err?.response?.data?.message ?? err?.message ?? 'Could not start session.');
     } finally { setSubmitting(false); }
   }, [selectedAssistantId, submitting, regName, regAge, regGender, regMobile, regGlasses, regAllergies]);
 
-  // FIX 3: optimistically move to monitoring, VR host will push state
   const startTest = useCallback(() => {
     localPeerService.send('start_test', { roomCode });
-    setView('monitoring'); // don't wait for any socket confirmation
+    setView('monitoring');
   }, [roomCode]);
 
   const endSession = useCallback(() => {
@@ -275,7 +249,6 @@ export default function ControllerScreen({ route, navigation }) {
               </View>
 
               <View style={s.formBody}>
-                {/* ── Step 1: Details ── */}
                 {regStep === 'details' && (
                   <>
                     <Field label="Full Name *" value={regName} onChange={setRegName} placeholder="e.g. Ravi Kumar" />
@@ -316,7 +289,6 @@ export default function ControllerScreen({ route, navigation }) {
                   </>
                 )}
 
-                {/* ── Step 2: Assistant ── */}
                 {regStep === 'assistant' && (
                   <>
                     <TouchableOpacity style={s.back} onPress={() => setRegStep('details')}>
@@ -403,25 +375,58 @@ export default function ControllerScreen({ route, navigation }) {
   // ═══════════════════════════════════════════════════════════════════════════
   const {
     phase, instruction, optotype, nearOptotype,
-    showLeft, showRight, colorShowLeft, colorShowRight,
-    nearShowLeft, nearShowRight, astigShowLeft, astigShowRight,
-    isComplete, plateIndex, isLensCheck, lensCheckEye,
+    showLeft, showRight,
+    colorShowLeft, colorShowRight,
+    nearShowLeft, nearShowRight,
+    astigShowLeft, astigShowRight,
+    plateIndex, isLensCheck, lensCheckEye, isComplete,
   } = vrState;
 
-  const eyeInfo = buildEyeInfo(
-    phase, showLeft, showRight, colorShowLeft, colorShowRight,
-    nearShowLeft, nearShowRight, astigShowLeft, astigShowRight, lensCheckEye
-  );
+  let leftActive, rightActive;
+  if (phase === 'color') {
+    leftActive = colorShowLeft; rightActive = colorShowRight;
+  } else if (phase === 'near') {
+    leftActive = nearShowLeft; rightActive = nearShowRight;
+  } else if (phase === 'astigmatism') {
+    leftActive = astigShowLeft; rightActive = astigShowRight;
+  } else {
+    leftActive = showLeft; rightActive = showRight;
+  }
+
+  const plateDots =
+    phase === 'color'
+      ? generatePlateDots(getPlate(plateIndex ?? 0))
+      : [];
+
+  // Reusable EyePanel props — identical for both eyes except side + active
+  const eyePanelProps = {
+    panelWidth: EYE_W,
+    panelHeight: EYE_H,
+    phase,
+    instruction,
+    patientName,
+    optotype,
+    plateDots,
+    plateIndex,
+    totalPlates: TOTAL_PLATES,
+    showFeedback: false,
+    feedbackSeen: false,
+    parallax: 0,
+    nearOptotype,
+    isLensCheck,
+    lensCheckEye,
+    contentTranslateX: 0,
+  };
 
   return (
     <SafeAreaProvider>
       <SafeAreaView style={s.root} edges={['top', 'bottom']}>
-        <StatusBar barStyle="light-content" />
+        <StatusBar barStyle="light-content" backgroundColor="#0a0a0f" />
         <PeerStatusBar connected={peerConnected} rtt={peerRtt} reconnecting={peerReconnecting} />
 
         <ScrollView contentContainerStyle={s.monitorScroll} showsVerticalScrollIndicator={false}>
 
-          {/* Header bar */}
+          {/* ── Header ──────────────────────────────────────────────── */}
           <View style={s.monitorHeader}>
             <View>
               <Text style={s.monitorLabel}>Patient</Text>
@@ -429,71 +434,113 @@ export default function ControllerScreen({ route, navigation }) {
             </View>
             <View>
               <Text style={s.monitorLabel}>Room</Text>
-              <Text style={[s.monitorValue, { fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace' }]}>{roomCode}</Text>
+              <Text style={[s.monitorValue, s.mono]}>{roomCode}</Text>
             </View>
             <View style={[s.phasePill, { backgroundColor: PHASE_COLORS[phase] ?? '#333' }]}>
               <Text style={s.phaseText}>{phase.toUpperCase()}</Text>
             </View>
           </View>
 
-          {/* Instruction */}
+          {/* ── Instruction ─────────────────────────────────────────── */}
           <View style={s.instructionBox}>
             <Text style={s.instructionLabel}>VR Instruction</Text>
             <Text style={s.instructionText}>{instruction}</Text>
           </View>
 
-          {/* Eye panels */}
-          <View style={s.eyePanels}>
-            <EyeMirrorPanel side="LEFT" active={eyeInfo.leftActive} label={eyeInfo.leftLabel} phase={phase} optotype={optotype} nearOptotype={nearOptotype} plateIndex={plateIndex} isLensCheck={isLensCheck} />
-            <View style={s.eyeDivider} />
-            <EyeMirrorPanel side="RIGHT" active={eyeInfo.rightActive} label={eyeInfo.rightLabel} phase={phase} optotype={optotype} nearOptotype={nearOptotype} plateIndex={plateIndex} isLensCheck={isLensCheck} />
+          {/* ── Eye Panel Preview ───────────────────────────────────── */}
+          {/*
+           * Double-wrapped overflow:hidden on each panel:
+           *   Outer View  — forces Android to clip absolutely positioned
+           *                 children (vignette, barrel overlay)
+           *   Inner View  — eyePanelWrapper — clips borderRadius corners
+           *
+           * EYE_W / EYE_H are computed from screen width so both eyes
+           * always fit side-by-side with no horizontal scroll needed.
+           */}
+          <View style={s.eyePreviewRow}>
+
+            {/* ── LEFT EYE ── */}
+            <View style={s.eyePreviewCard}>
+              <Text style={s.eyePreviewLabel}>L</Text>
+              {/* Outer clip — fixes Android vignette bleed */}
+              <View style={{ width: EYE_W, height: EYE_H, overflow: 'hidden', borderRadius: 6 }}>
+                {/* Inner clip — rounds corners */}
+                <View style={[s.eyePanelWrapper, { width: EYE_W, height: EYE_H }]}>
+                  <EyePanel {...eyePanelProps} side="left" active={leftActive} />
+                </View>
+              </View>
+            </View>
+
+            {/* ── Divider ── */}
+            <View style={[s.eyeCentreDivider, { height: EYE_H + 20 }]} />
+
+            {/* ── RIGHT EYE ── */}
+            <View style={s.eyePreviewCard}>
+              <Text style={s.eyePreviewLabel}>R</Text>
+              {/* Outer clip — fixes Android vignette bleed */}
+              <View style={{ width: EYE_W, height: EYE_H, overflow: 'hidden', borderRadius: 6 }}>
+                {/* Inner clip — rounds corners */}
+                <View style={[s.eyePanelWrapper, { width: EYE_W, height: EYE_H }]}>
+                  <EyePanel {...eyePanelProps} side="right" active={rightActive} />
+                </View>
+              </View>
+            </View>
+
           </View>
 
-          {(optotype || nearOptotype) && (
-            <View style={s.optotypeInfo}>
-              <Text style={s.optotypeInfoLabel}>Current Optotype</Text>
-              <Text style={s.optotypeInfoValue}>
-                {(optotype ?? nearOptotype)?.letter ?? '\u2014'}
-                {optotype?.rotation != null ? `  rot: ${optotype.rotation}\u00b0` : ''}
-                {(optotype ?? nearOptotype)?.acuityLabel ? `  \u00b7  ${(optotype ?? nearOptotype).acuityLabel}` : ''}
-              </Text>
+          {/* ── Phase detail row ────────────────────────────────────── */}
+          {phase === 'acuity' && optotype && (
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Letter:</Text>
+              <Text style={s.infoVal}>{optotype.letter}</Text>
+              {optotype.rotation != null && (
+                <><Text style={s.infoLabel}>Rotation:</Text><Text style={s.infoVal}>{optotype.rotation}°</Text></>
+              )}
+              {optotype.acuityLabel && (
+                <><Text style={s.infoLabel}>Acuity:</Text><Text style={s.infoVal}>{optotype.acuityLabel}</Text></>
+              )}
+            </View>
+          )}
+
+          {phase === 'near' && nearOptotype && (
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Near letter:</Text>
+              <Text style={s.infoVal}>{nearOptotype.letter}</Text>
+              {nearOptotype.acuityLabel && (
+                <><Text style={s.infoLabel}>Acuity:</Text><Text style={s.infoVal}>{nearOptotype.acuityLabel}</Text></>
+              )}
             </View>
           )}
 
           {phase === 'color' && (
-            <View style={s.optotypeInfo}>
-              <Text style={s.optotypeInfoLabel}>Ishihara Plate</Text>
-              <Text style={s.optotypeInfoValue}>#{plateIndex + 1}</Text>
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Ishihara Plate:</Text>
+              <Text style={s.infoVal}>#{(plateIndex ?? 0) + 1} / {TOTAL_PLATES}</Text>
             </View>
           )}
 
+          {phase === 'astigmatism' && (
+            <View style={s.infoRow}>
+              <Text style={s.infoLabel}>Astigmatism clock chart</Text>
+            </View>
+          )}
+
+          {/* ── Complete banner ─────────────────────────────────────── */}
           {isComplete && (
             <View style={s.completeBox}>
               <Text style={s.completeText}>\u2705  Test Complete</Text>
             </View>
           )}
 
+          {/* ── End Session ─────────────────────────────────────────── */}
           <TouchableOpacity style={[s.btn, s.endBtn]} onPress={endSession}>
             <Text style={s.btnText}>End Session</Text>
           </TouchableOpacity>
+
         </ScrollView>
       </SafeAreaView>
     </SafeAreaProvider>
   );
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-const PHASE_COLORS = {
-  waiting: '#444', acuity: '#5b5bd6', color: '#e91e63',
-  near: '#009688', astigmatism: '#ff9800', complete: '#4caf50',
-};
-
-function buildEyeInfo(phase, showLeft, showRight, colorL, colorR, nearL, nearR, astigL, astigR) {
-  if (phase === 'color') return { leftActive: colorL, rightActive: colorR, leftLabel: colorL ? 'Showing color plate' : 'Occluded', rightLabel: colorR ? 'Showing color plate' : 'Occluded' };
-  if (phase === 'near') return { leftActive: nearL, rightActive: nearR, leftLabel: nearL ? 'Near vision active' : 'Occluded', rightLabel: nearR ? 'Near vision active' : 'Occluded' };
-  if (phase === 'astigmatism') return { leftActive: astigL, rightActive: astigR, leftLabel: astigL ? 'Astigmatism chart' : 'Occluded', rightLabel: astigR ? 'Astigmatism chart' : 'Occluded' };
-  return { leftActive: showLeft, rightActive: showRight, leftLabel: showLeft ? 'Optotype visible' : 'Occluded', rightLabel: showRight ? 'Optotype visible' : 'Occluded' };
 }
 
 // ── Sub-components ────────────────────────────────────────────────────────────
@@ -507,23 +554,6 @@ function PeerStatusBar({ connected, rtt, reconnecting }) {
   return (
     <View style={[ps.bar, { borderBottomColor: color + '44' }]}>
       <Text style={[ps.text, { color }]}>{label}</Text>
-    </View>
-  );
-}
-
-function EyeMirrorPanel({ side, active, label, phase, optotype, nearOptotype, plateIndex, isLensCheck }) {
-  return (
-    <View style={[s.eyePanel, !active && s.eyePanelOff]}>
-      <Text style={[s.eyePanelSide, active ? s.eyePanelSideActive : s.eyePanelSideOff]}>{side}</Text>
-      <View style={s.eyePanelDot}>
-        <View style={[s.eyeDot, active ? s.eyeDotActive : s.eyeDotOff]} />
-      </View>
-      <Text style={[s.eyePanelLabel, !active && s.eyePanelLabelOff]}>{label}</Text>
-      {active && isLensCheck && <Text style={s.eyeDetail}>\uD83D\uDD35 Lens alignment circles</Text>}
-      {active && phase === 'acuity' && optotype && <Text style={s.eyeDetail}>Letter: <Text style={s.eyeDetailVal}>{optotype.letter}</Text></Text>}
-      {active && phase === 'near' && nearOptotype && <Text style={s.eyeDetail}>Near: <Text style={s.eyeDetailVal}>{nearOptotype.letter}</Text></Text>}
-      {active && phase === 'astigmatism' && <Text style={s.eyeDetail}>Astigmatism chart visible</Text>}
-      {active && phase === 'color' && <Text style={s.eyeDetail}>Plate #{plateIndex + 1}</Text>}
     </View>
   );
 }
@@ -543,12 +573,22 @@ function Field({ label, value, onChange, placeholder, keyboardType, maxLength, f
   return (
     <View style={[s.field, flex && { flex }]}>
       <Text style={s.label}>{label}</Text>
-      <TextInput style={s.input} value={value} onChangeText={onChange} placeholder={placeholder} placeholderTextColor="#444" keyboardType={keyboardType} maxLength={maxLength} autoCorrect={false} />
+      <TextInput
+        style={s.input}
+        value={value}
+        onChangeText={onChange}
+        placeholder={placeholder}
+        placeholderTextColor="#444"
+        keyboardType={keyboardType}
+        maxLength={maxLength}
+        autoCorrect={false}
+      />
     </View>
   );
 }
 
 // ── Styles ────────────────────────────────────────────────────────────────────
+
 const ps = StyleSheet.create({
   bar: { paddingVertical: 6, paddingHorizontal: 16, borderBottomWidth: 1, borderBottomColor: '#333', backgroundColor: 'rgba(0,0,0,0.3)' },
   text: { fontSize: 11, fontWeight: '500' },
@@ -640,9 +680,11 @@ const s = StyleSheet.create({
   roomLabel: { fontSize: 9, fontWeight: '700', letterSpacing: 1.5, color: '#5b5bd6', textTransform: 'uppercase' },
   roomCodeText: { fontSize: 13, fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontWeight: '700', color: '#c0c0e0', letterSpacing: 1.3 },
 
+  // ── Monitoring ───────────────────────────────────────────────────────────
   monitorHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', padding: 14, backgroundColor: 'rgba(255,255,255,0.03)', borderWidth: 1, borderColor: 'rgba(124,124,240,0.12)', borderRadius: 12, marginBottom: 12 },
   monitorLabel: { color: '#555', fontSize: 10, fontWeight: '600', letterSpacing: 1, textTransform: 'uppercase' },
   monitorValue: { color: '#c0c0e0', fontSize: 14, fontWeight: '600' },
+  mono: { fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace' },
   phasePill: { paddingVertical: 4, paddingHorizontal: 12, borderRadius: 100 },
   phaseText: { color: '#fff', fontSize: 11, fontWeight: '700', letterSpacing: 1 },
 
@@ -650,25 +692,39 @@ const s = StyleSheet.create({
   instructionLabel: { color: '#5b5bd6', fontSize: 10, fontWeight: '600', letterSpacing: 1, textTransform: 'uppercase' },
   instructionText: { color: '#c0c0e0', fontSize: 15, lineHeight: 22 },
 
-  eyePanels: { flexDirection: 'row', borderWidth: 1, borderColor: 'rgba(124,124,240,0.12)', borderRadius: 12, overflow: 'hidden', marginBottom: 12 },
-  eyePanel: { flex: 1, padding: 14, gap: 8, backgroundColor: 'rgba(91,91,214,0.04)' },
-  eyePanelOff: { backgroundColor: 'rgba(0,0,0,0.3)' },
-  eyeDivider: { width: 1, backgroundColor: 'rgba(124,124,240,0.12)' },
-  eyePanelSide: { fontSize: 11, fontWeight: '700', letterSpacing: 1.5 },
-  eyePanelSideActive: { color: '#a0a0f0' },
-  eyePanelSideOff: { color: '#333' },
-  eyePanelDot: { flexDirection: 'row' },
-  eyeDot: { width: 8, height: 8, borderRadius: 4 },
-  eyeDotActive: { backgroundColor: '#4caf50' },
-  eyeDotOff: { backgroundColor: '#333' },
-  eyePanelLabel: { color: '#888', fontSize: 12 },
-  eyePanelLabelOff: { color: '#444' },
-  eyeDetail: { color: '#666', fontSize: 11 },
-  eyeDetailVal: { color: '#a0a0f0', fontWeight: '700' },
+  // ── Eye preview — NO duplicate keys ─────────────────────────────────────
+  eyePreviewRow: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    justifyContent: 'center',
+    marginBottom: 12,
+    // no paddingHorizontal — panels already fill (W - 38) / 2 each
+  },
+  eyePreviewCard: { alignItems: 'center', gap: 4 },
+  eyePreviewLabel: {
+    color: 'rgba(180,180,180,0.6)',
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 2,
+    marginBottom: 2,
+    textTransform: 'uppercase',
+  },
+  // Inner clip only — outer clip is inlined to avoid StyleSheet duplicate key issue
+  eyePanelWrapper: {
+    borderRadius: 6,
+    overflow: 'hidden',
+  },
+  // Single definition — height injected inline as { height: EYE_H + 20 }
+  eyeCentreDivider: {
+    width: 2,
+    backgroundColor: '#1a1a1a',
+    marginTop: 22,
+  },
 
-  optotypeInfo: { flexDirection: 'row', alignItems: 'center', gap: 12, backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 10, padding: 12, marginBottom: 8 },
-  optotypeInfoLabel: { color: '#555', fontSize: 11, fontWeight: '600', letterSpacing: 0.5 },
-  optotypeInfoValue: { flex: 1, color: '#c0c0e0', fontSize: 16, fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontWeight: '700' },
+  // ── Info rows ────────────────────────────────────────────────────────────
+  infoRow: { flexDirection: 'row', alignItems: 'center', flexWrap: 'wrap', gap: 8, backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 10, padding: 12, marginBottom: 8 },
+  infoLabel: { color: '#555', fontSize: 11, fontWeight: '600' },
+  infoVal: { color: '#c0c0e0', fontSize: 13, fontFamily: Platform.OS === 'ios' ? 'Courier New' : 'monospace', fontWeight: '700' },
 
   completeBox: { backgroundColor: 'rgba(76,175,80,0.1)', borderWidth: 1, borderColor: 'rgba(76,175,80,0.3)', borderRadius: 12, padding: 16, alignItems: 'center', marginBottom: 8 },
   completeText: { color: '#81c784', fontSize: 16, fontWeight: '600' },
